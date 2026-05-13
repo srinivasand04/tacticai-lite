@@ -1,0 +1,49 @@
+# ── Virtual environment ───────────────────────────────────────────────────────
+tacticai_env/
+venv/
+env/
+.venv/
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+.Python
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── StatsBomb data cache ──────────────────────────────────────────────────────
+# Re-generated automatically on first run (python -m data.loader)
+data/corners_cache.pkl
+
+# ── Generated outputs ─────────────────────────────────────────────────────────
+# Keep figures in the repo — interviewers can see pitch visualizations on GitHub
+# without having to run the notebook locally.
+outputs/results/*.csv
+outputs/results/*.json
+
+# ── StatsBomb internal cache (created by statsbombpy at runtime) ──────────────
+.cache/
+
+# ── OS / IDE ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Distribution / packaging ──────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+
+# ── Testing / coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
