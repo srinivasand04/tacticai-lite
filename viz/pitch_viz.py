@@ -267,61 +267,72 @@ def plot_training_curves(
     save_name: str = "training_curves.png",
 ) -> None:
     """
-    Side-by-side training loss and accuracy curves for GCN and GAT.
+    Side-by-side training loss, Top-1, and Top-3 accuracy curves for GCN and GAT.
 
     Parameters
     ----------
-    gcn_history : dict with keys train_loss, val_loss, train_acc, val_acc
+    gcn_history : dict with keys train_loss, val_loss, train_acc1, val_acc1,
+                  train_acc3, val_acc3  (v2 trainer format)
     gat_history : same structure
     """
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.patch.set_facecolor("#0d1b2a")
 
     GCN_COLOR = "#2ec4b6"   # teal
     GAT_COLOR = "#ff9f1c"   # orange
 
-    epochs = range(1, len(gcn_history["train_loss"]) + 1)
+    # Align lengths in case early stopping gave different epoch counts
+    gcn_len = len(gcn_history["train_loss"])
+    gat_len = len(gat_history["train_loss"])
 
-    # Loss
+    gcn_ep = range(1, gcn_len + 1)
+    gat_ep = range(1, gat_len + 1)
+
+    # ── Panel 1: Loss ────────────────────────────────────────────────────────
     ax = axes[0]
     ax.set_facecolor("#1a1a2e")
-    ax.plot(epochs, gcn_history["val_loss"], color=GCN_COLOR,
-            linewidth=2, label="GCN val loss")
-    ax.plot(epochs, gat_history["val_loss"], color=GAT_COLOR,
-            linewidth=2, label="GAT val loss")
-    ax.plot(epochs, gcn_history["train_loss"], color=GCN_COLOR,
-            linewidth=1, linestyle="--", alpha=0.6, label="GCN train loss")
-    ax.plot(epochs, gat_history["train_loss"], color=GAT_COLOR,
-            linewidth=1, linestyle="--", alpha=0.6, label="GAT train loss")
-    ax.set_title("Loss", color="white", fontsize=13, fontweight="bold")
+    ax.plot(gcn_ep, gcn_history["val_loss"],   color=GCN_COLOR, lw=2, label="GCN val")
+    ax.plot(gat_ep, gat_history["val_loss"],   color=GAT_COLOR, lw=2, label="GAT val")
+    ax.plot(gcn_ep, gcn_history["train_loss"], color=GCN_COLOR, lw=1, ls="--", alpha=0.5, label="GCN train")
+    ax.plot(gat_ep, gat_history["train_loss"], color=GAT_COLOR, lw=1, ls="--", alpha=0.5, label="GAT train")
+    ax.set_title("NLL Loss", color="white", fontsize=13, fontweight="bold")
     ax.set_xlabel("Epoch", color="white")
-    ax.set_ylabel("NLL Loss", color="white")
     ax.tick_params(colors="white")
     ax.spines[:].set_color("#444")
     ax.grid(True, alpha=0.2)
-    ax.legend(facecolor="#0d1b2a", edgecolor="#444", labelcolor="white")
+    ax.legend(facecolor="#0d1b2a", edgecolor="#444", labelcolor="white", fontsize=8)
 
-    # Accuracy
+    # ── Panel 2: Top-1 accuracy ──────────────────────────────────────────────
     ax = axes[1]
     ax.set_facecolor("#1a1a2e")
-    ax.plot(epochs, [v * 100 for v in gcn_history["val_acc"]],
-            color=GCN_COLOR, linewidth=2, label="GCN val acc")
-    ax.plot(epochs, [v * 100 for v in gat_history["val_acc"]],
-            color=GAT_COLOR, linewidth=2, label="GAT val acc")
-    ax.plot(epochs, [v * 100 for v in gcn_history["train_acc"]],
-            color=GCN_COLOR, linewidth=1, linestyle="--", alpha=0.6, label="GCN train acc")
-    ax.plot(epochs, [v * 100 for v in gat_history["train_acc"]],
-            color=GAT_COLOR, linewidth=1, linestyle="--", alpha=0.6, label="GAT train acc")
-    ax.set_title("Accuracy", color="white", fontsize=13, fontweight="bold")
+    ax.plot(gcn_ep, [v*100 for v in gcn_history["val_acc1"]],   color=GCN_COLOR, lw=2, label="GCN val")
+    ax.plot(gat_ep, [v*100 for v in gat_history["val_acc1"]],   color=GAT_COLOR, lw=2, label="GAT val")
+    ax.plot(gcn_ep, [v*100 for v in gcn_history["train_acc1"]], color=GCN_COLOR, lw=1, ls="--", alpha=0.5, label="GCN train")
+    ax.plot(gat_ep, [v*100 for v in gat_history["train_acc1"]], color=GAT_COLOR, lw=1, ls="--", alpha=0.5, label="GAT train")
+    ax.set_title("Top-1 Accuracy", color="white", fontsize=13, fontweight="bold")
     ax.set_xlabel("Epoch", color="white")
     ax.set_ylabel("Accuracy (%)", color="white")
     ax.tick_params(colors="white")
     ax.spines[:].set_color("#444")
     ax.grid(True, alpha=0.2)
-    ax.legend(facecolor="#0d1b2a", edgecolor="#444", labelcolor="white")
+    ax.legend(facecolor="#0d1b2a", edgecolor="#444", labelcolor="white", fontsize=8)
 
-    plt.suptitle("GCN vs GAT — Training History", color="white",
-                 fontsize=15, fontweight="bold", y=1.02)
+    # ── Panel 3: Top-3 accuracy ──────────────────────────────────────────────
+    ax = axes[2]
+    ax.set_facecolor("#1a1a2e")
+    ax.plot(gcn_ep, [v*100 for v in gcn_history["val_acc3"]],   color=GCN_COLOR, lw=2, label="GCN val")
+    ax.plot(gat_ep, [v*100 for v in gat_history["val_acc3"]],   color=GAT_COLOR, lw=2, label="GAT val")
+    ax.plot(gcn_ep, [v*100 for v in gcn_history["train_acc3"]], color=GCN_COLOR, lw=1, ls="--", alpha=0.5, label="GCN train")
+    ax.plot(gat_ep, [v*100 for v in gat_history["train_acc3"]], color=GAT_COLOR, lw=1, ls="--", alpha=0.5, label="GAT train")
+    ax.set_title("Top-3 Accuracy (tactical metric)", color="white", fontsize=13, fontweight="bold")
+    ax.set_xlabel("Epoch", color="white")
+    ax.tick_params(colors="white")
+    ax.spines[:].set_color("#444")
+    ax.grid(True, alpha=0.2)
+    ax.legend(facecolor="#0d1b2a", edgecolor="#444", labelcolor="white", fontsize=8)
+
+    plt.suptitle("GCN vs GAT — Training History (v2, 815 sequences)",
+                 color="white", fontsize=14, fontweight="bold", y=1.02)
     plt.tight_layout()
 
     save_path = FIG_DIR / save_name
@@ -351,41 +362,53 @@ def plot_model_comparison(
     models = comparison_df["Model"].tolist()
     colors = ["#2ec4b6", "#ff9f1c"]   # GCN teal, GAT orange
 
-    # ── Accuracy panel ──────────────────────────────────────────────────────
-    accs = [
-        float(v.replace("%", ""))
-        for v in comparison_df["Val Accuracy"].tolist()
-    ]
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+    fig.patch.set_facecolor("#0d1b2a")
+
+    def _pct(col):
+        return [float(v.replace("%", "")) for v in comparison_df[col].tolist()]
+
+    # ── Top-1 Accuracy ───────────────────────────────────────────────────────
+    accs1 = _pct("Top-1 Accuracy")
     ax = axes[0]
     ax.set_facecolor("#1a1a2e")
-    bars = ax.barh(models, accs, color=colors, edgecolor="white",
-                   linewidth=0.6, height=0.5)
-    for bar, val in zip(bars, accs):
+    bars = ax.barh(models, accs1, color=colors, edgecolor="white", linewidth=0.6, height=0.5)
+    for bar, val in zip(bars, accs1):
         ax.text(bar.get_width() + 0.3, bar.get_y() + bar.get_height() / 2,
                 f"{val:.1f}%", va="center", color="white", fontsize=11)
-    ax.set_title("Validation Accuracy (%)", color="white",
-                 fontsize=12, fontweight="bold")
-    ax.set_xlim(0, max(accs) * 1.3)
+    ax.set_title("Top-1 Accuracy (%)", color="white", fontsize=12, fontweight="bold")
+    ax.set_xlim(0, max(accs1) * 1.4)
     ax.tick_params(colors="white")
     ax.spines[:].set_color("#444")
 
-    # ── Inference time panel ─────────────────────────────────────────────────
-    times = [float(v) for v in comparison_df["Avg Inference (ms)"].tolist()]
+    # ── Top-3 Accuracy ───────────────────────────────────────────────────────
+    accs3 = _pct("Top-3 Accuracy")
     ax = axes[1]
     ax.set_facecolor("#1a1a2e")
-    bars = ax.barh(models, times, color=colors, edgecolor="white",
-                   linewidth=0.6, height=0.5)
-    for bar, val in zip(bars, times):
-        ax.text(bar.get_width() + 0.02, bar.get_y() + bar.get_height() / 2,
-                f"{val:.2f} ms", va="center", color="white", fontsize=11)
-    ax.set_title("Avg Inference Time (ms / graph)", color="white",
-                 fontsize=12, fontweight="bold")
-    ax.set_xlim(0, max(times) * 1.35)
+    bars = ax.barh(models, accs3, color=colors, edgecolor="white", linewidth=0.6, height=0.5)
+    for bar, val in zip(bars, accs3):
+        ax.text(bar.get_width() + 0.3, bar.get_y() + bar.get_height() / 2,
+                f"{val:.1f}%", va="center", color="white", fontsize=11)
+    ax.set_title("Top-3 Accuracy (%) — tactical metric", color="white", fontsize=12, fontweight="bold")
+    ax.set_xlim(0, max(accs3) * 1.3)
     ax.tick_params(colors="white")
     ax.spines[:].set_color("#444")
 
-    plt.suptitle("GCN vs GAT — Model Comparison", color="white",
-                 fontsize=14, fontweight="bold")
+    # ── Inference time ───────────────────────────────────────────────────────
+    times = [float(v) for v in comparison_df["Avg Inference (ms)"].tolist()]
+    ax = axes[2]
+    ax.set_facecolor("#1a1a2e")
+    bars = ax.barh(models, times, color=colors, edgecolor="white", linewidth=0.6, height=0.5)
+    for bar, val in zip(bars, times):
+        ax.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height() / 2,
+                f"{val:.2f} ms", va="center", color="white", fontsize=11)
+    ax.set_title("Avg Inference (ms / graph)", color="white", fontsize=12, fontweight="bold")
+    ax.set_xlim(0, max(times) * 1.5)
+    ax.tick_params(colors="white")
+    ax.spines[:].set_color("#444")
+
+    plt.suptitle("GCN vs GAT — Model Comparison (v2, 815 sequences)",
+                 color="white", fontsize=14, fontweight="bold")
     plt.tight_layout()
 
     save_path = FIG_DIR / save_name
