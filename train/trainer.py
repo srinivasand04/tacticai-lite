@@ -249,11 +249,18 @@ if __name__ == "__main__":
         print("Not enough graphs. Run `python -m data.loader` first.")
         sys.exit(1)
 
-    gcn, gcn_h = run_full_training(graphs, "gcn", epochs=10, verbose=True)
-    gat, gat_h = run_full_training(graphs, "gat", epochs=10, verbose=True)
+    # Full training run: 100 epochs max, early stopping at patience=15
+    gcn, gcn_h = run_full_training(graphs, "gcn", epochs=100, verbose=True)
+    gat, gat_h = run_full_training(graphs, "gat", epochs=100, verbose=True)
 
     from sklearn.model_selection import train_test_split
     _, val_g = train_test_split(graphs, test_size=0.2, random_state=42)
     df = compare_models(gcn, gat, val_g)
     print("\nv2 Model Comparison:")
-    print(df.to_string(index=False))
+    # Use tabulate-style formatting so all columns align cleanly
+    col_widths = {col: max(len(col), df[col].astype(str).str.len().max()) for col in df.columns}
+    header = "  ".join(col.ljust(col_widths[col]) for col in df.columns)
+    print("\n" + header)
+    print("-" * len(header))
+    for _, row in df.iterrows():
+        print("  ".join(str(row[col]).ljust(col_widths[col]) for col in df.columns))
