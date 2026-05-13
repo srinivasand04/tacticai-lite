@@ -1,31 +1,21 @@
 """
-train/trainer.py — Shared training loop for GCN and GAT
-=========================================================
-Both models share the same training logic:
-  - Loss      : Negative Log-Likelihood (NLLLoss) on per-graph softmax output
-  - Optimizer : Adam (lr=0.001, weight_decay=1e-4)
-  - Scheduler : StepLR — halve lr every 20 epochs
-  - Epochs    : 60
+train/trainer.py — Training loop v2
+=====================================
+v2 changes vs v1:
+    + Top-3 accuracy metric (was the true shooter in the top 3 predictions?)
+    + Early stopping: stop if val accuracy doesn't improve for 15 epochs
+    + Best-model checkpointing: saves the weights at the best val epoch
+    + Longer training: 100 epochs max (early stopping kicks in earlier usually)
+    + compare_models() now reports Top-1 AND Top-3 accuracy
 
-Why NLL loss?
-    After the final linear layer, we apply log_softmax over all player nodes
-    in a graph. NLLLoss then penalises the negative log-probability assigned
-    to the true receiver node. This is equivalent to cross-entropy loss but
-    structured for our per-graph node classification setup.
-
-Why Adam + StepLR?
-    Adam adapts learning rates per parameter — robust to scale differences
-    between feature dimensions. StepLR prevents overfitting after initial
-    fast convergence on a small dataset (~500–800 graphs).
-
-Expected accuracy
-    Random baseline: 1 / avg_players ≈ 9 % (if 11 attackers per frame).
-    GCN typically reaches 30–40 % on this task.
-    GAT typically reaches 35–44 % — better but not always by a huge margin.
-    The limited dataset size is the main bottleneck, not architecture choice.
+Why Top-3 accuracy?
+    With ~17 players per graph, Top-1 baseline = 5.8%, Top-3 baseline = 17.6%.
+    A model that puts the true shooter in its top 3 is tactically useful —
+    it narrows the field from 17 to 3. This is the metric TacticAI reports.
 """
 
 import time
+import copy
 import numpy as np
 import pandas as pd
 import torch
@@ -36,150 +26,97 @@ from torch_geometric.loader import DataLoader
 from sklearn.model_selection import train_test_split
 
 
-# ─── Loss helper ─────────────────────────────────────────────────────────────
+# ── Loss and accuracy helpers ──────────────────────────────────────────────────
 
-def _per_graph_nll_loss(logits: torch.Tensor, y: torch.Tensor, ptr) -> torch.Tensor:
-    """
-    Compute NLL loss by applying per-graph log_softmax then selecting the
-    true receiver node's log-probability.
-
-    Parameters
-    ----------
-    logits : Tensor [N, 1]  — raw scores from model
-    y      : Tensor [B]     — receiver node index (relative to each graph)
-    ptr    : Tensor [B+1]   — cumulative node counts (from DataBatch)
-
-    The ptr tensor tells us where each graph starts and ends in the flattened
-    node list. For example, ptr = [0, 11, 20, 33] means:
-        graph 0: nodes 0–10,  graph 1: nodes 11–19,  graph 2: nodes 20–32
-    """
+def _per_graph_nll_loss(logits, y, ptr):
+    """NLL loss: apply log_softmax per graph, index the true receiver."""
     loss = 0.0
-    n_graphs = len(ptr) - 1
-
-    for i in range(n_graphs):
-        start, end = ptr[i].item(), ptr[i + 1].item()
-        graph_logits = logits[start:end].squeeze(-1)          # [n_i]
-        log_probs    = F.log_softmax(graph_logits, dim=0)     # [n_i]
-        label        = y[i].item()
-
-        if label < len(log_probs):
-            loss += -log_probs[label]
-        else:
-            # Safety: if label out of range (shouldn't happen), use last node
-            loss += -log_probs[-1]
-
-    return loss / max(n_graphs, 1)
+    n = len(ptr) - 1
+    for i in range(n):
+        s, e = ptr[i].item(), ptr[i+1].item()
+        lp    = F.log_softmax(logits[s:e].squeeze(-1), dim=0)
+        label = min(y[i].item(), e - s - 1)
+        loss += -lp[label]
+    return loss / max(n, 1)
 
 
-def _per_graph_accuracy(logits: torch.Tensor, y: torch.Tensor, ptr) -> float:
-    """Compute fraction of graphs where argmax matches true receiver."""
-    correct  = 0
-    n_graphs = len(ptr) - 1
+def _per_graph_topk_accuracy(logits, y, ptr, k=1):
+    """
+    Top-k accuracy: fraction of graphs where the true receiver
+    appears in the model's top-k predictions.
 
-    for i in range(n_graphs):
-        start, end = ptr[i].item(), ptr[i + 1].item()
-        graph_logits = logits[start:end].squeeze(-1)
-        pred  = graph_logits.argmax().item()
-        label = y[i].item()
-        if pred == label:
+    k=1  → exact match (standard accuracy)
+    k=3  → true receiver is one of the 3 highest-probability players
+    """
+    correct = 0
+    n = len(ptr) - 1
+    for i in range(n):
+        s, e  = ptr[i].item(), ptr[i+1].item()
+        scores = logits[s:e].squeeze(-1)
+        topk   = torch.topk(scores, min(k, e - s)).indices.tolist()
+        label  = y[i].item()
+        if label in topk:
             correct += 1
+    return correct / max(n, 1)
 
-    return correct / max(n_graphs, 1)
 
+# ── Epoch-level train/eval ─────────────────────────────────────────────────────
 
-# ─── Epoch-level functions ────────────────────────────────────────────────────
-
-def train_epoch(model, loader: DataLoader, optimizer) -> tuple[float, float]:
-    """
-    Run one training epoch over `loader`.
-
-    Returns
-    -------
-    (avg_loss, avg_accuracy)
-    """
+def train_epoch(model, loader, optimizer):
     model.train()
-    total_loss = 0.0
-    total_acc  = 0.0
-    n_batches  = 0
-
+    total_loss, total_acc1, total_acc3, n = 0.0, 0.0, 0.0, 0
     for batch in loader:
         optimizer.zero_grad()
         logits = model(batch)
         loss   = _per_graph_nll_loss(logits, batch.y, batch.ptr)
         loss.backward()
         optimizer.step()
-
         with torch.no_grad():
-            acc = _per_graph_accuracy(logits, batch.y, batch.ptr)
-
-        total_loss += loss.item()
-        total_acc  += acc
-        n_batches  += 1
-
-    return total_loss / max(n_batches, 1), total_acc / max(n_batches, 1)
+            total_loss += loss.item()
+            total_acc1 += _per_graph_topk_accuracy(logits, batch.y, batch.ptr, k=1)
+            total_acc3 += _per_graph_topk_accuracy(logits, batch.y, batch.ptr, k=3)
+            n += 1
+    return total_loss/max(n,1), total_acc1/max(n,1), total_acc3/max(n,1)
 
 
-def evaluate(model, loader: DataLoader) -> tuple[float, float]:
-    """
-    Evaluate model on `loader` — no gradient computation.
-
-    Returns
-    -------
-    (avg_loss, avg_accuracy)
-    """
+def evaluate(model, loader):
     model.eval()
-    total_loss = 0.0
-    total_acc  = 0.0
-    n_batches  = 0
-
+    total_loss, total_acc1, total_acc3, n = 0.0, 0.0, 0.0, 0
     with torch.no_grad():
         for batch in loader:
             logits = model(batch)
-            loss   = _per_graph_nll_loss(logits, batch.y, batch.ptr)
-            acc    = _per_graph_accuracy(logits, batch.y, batch.ptr)
-
-            total_loss += loss.item()
-            total_acc  += acc
-            n_batches  += 1
-
-    return total_loss / max(n_batches, 1), total_acc / max(n_batches, 1)
+            total_loss += _per_graph_nll_loss(logits, batch.y, batch.ptr).item()
+            total_acc1 += _per_graph_topk_accuracy(logits, batch.y, batch.ptr, k=1)
+            total_acc3 += _per_graph_topk_accuracy(logits, batch.y, batch.ptr, k=3)
+            n += 1
+    return total_loss/max(n,1), total_acc1/max(n,1), total_acc3/max(n,1)
 
 
-# ─── Full training run ────────────────────────────────────────────────────────
+# ── Full training run ──────────────────────────────────────────────────────────
 
 def run_full_training(
-    graphs:      list,
-    model_name:  str   = "gcn",
-    epochs:      int   = 60,
-    lr:          float = 0.001,
-    weight_decay:float = 1e-4,
-    batch_size:  int   = 32,
-    val_frac:    float = 0.2,
-    step_size:   int   = 20,
-    gamma:       float = 0.5,
-    verbose:     bool  = True,
-) -> tuple:
+    graphs,
+    model_name   = "gcn",
+    epochs       = 100,
+    lr           = 0.001,
+    weight_decay = 1e-4,
+    batch_size   = 32,
+    val_frac     = 0.2,
+    step_size    = 25,
+    gamma        = 0.5,
+    patience     = 15,      # NEW: early stopping patience
+    verbose      = True,
+):
     """
-    Train GCN or GAT on the corner kick dataset.
+    Train GCN or GAT with early stopping and best-model checkpointing.
 
-    Parameters
-    ----------
-    graphs      : list of torch_geometric.data.Data objects
-    model_name  : "gcn" or "gat"
-    epochs      : number of training epochs
-    lr          : Adam initial learning rate
-    weight_decay: Adam L2 regularisation
-    batch_size  : graphs per mini-batch
-    val_frac    : fraction of data held out for validation
-    step_size   : StepLR period (epochs)
-    gamma       : StepLR decay factor
+    Early stopping:
+        If val Top-1 accuracy doesn't improve for `patience` epochs,
+        training stops and the best weights are restored.
+        This prevents overfitting on the training set.
 
-    Returns
-    -------
-    (model, history_dict)
-        history_dict keys: train_loss, val_loss, train_acc, val_acc
+    Returns (model_with_best_weights, history_dict)
     """
-    # ── Import model ────────────────────────────────────────────────────────
     if model_name.lower() == "gcn":
         from models.gcn import GCN
         model = GCN()
@@ -187,95 +124,94 @@ def run_full_training(
         from models.gat import GAT
         model = GAT()
     else:
-        raise ValueError(f"Unknown model: {model_name}. Choose 'gcn' or 'gat'.")
+        raise ValueError(f"Unknown model: {model_name}")
 
-    # ── Split ───────────────────────────────────────────────────────────────
-    train_graphs, val_graphs = train_test_split(
-        graphs, test_size=val_frac, random_state=42
-    )
-
+    train_graphs, val_graphs = train_test_split(graphs, test_size=val_frac, random_state=42)
     train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)
     val_loader   = DataLoader(val_graphs,   batch_size=batch_size, shuffle=False)
 
-    # ── Optimiser + scheduler ───────────────────────────────────────────────
     optimizer = Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = StepLR(optimizer, step_size=step_size, gamma=gamma)
 
-    # ── Baseline ────────────────────────────────────────────────────────────
     avg_nodes    = np.mean([g.num_nodes for g in graphs])
-    baseline_acc = 1.0 / avg_nodes
+    baseline_1   = 1.0 / avg_nodes
+    baseline_3   = min(3.0 / avg_nodes, 1.0)
+
     if verbose:
-        print(f"\n{'='*60}")
-        print(f"Training {model_name.upper()}  |  {model.count_parameters():,} parameters")
-        print(f"{'='*60}")
+        print(f"\n{'='*62}")
+        print(f"Training {model_name.upper()} v2  |  {model.count_parameters():,} parameters")
+        print(f"{'='*62}")
         print(f"  Dataset   : {len(train_graphs)} train / {len(val_graphs)} val")
-        print(f"  Baseline  : {baseline_acc*100:.1f}%  (random — 1/{avg_nodes:.0f} players)")
+        print(f"  Baseline  : Top-1 {baseline_1*100:.1f}%  |  Top-3 {baseline_3*100:.1f}%")
+        print(f"  Patience  : {patience} epochs early stopping")
         print()
 
-    history = {
-        "train_loss": [], "val_loss": [],
-        "train_acc" : [], "val_acc" : [],
-    }
+    history = {"train_loss":[], "val_loss":[], "train_acc1":[], "val_acc1":[],
+               "train_acc3":[], "val_acc3":[]}
 
-    # ── Training loop ───────────────────────────────────────────────────────
+    best_val_acc  = 0.0
+    best_weights  = copy.deepcopy(model.state_dict())
+    no_improve    = 0
+
     for epoch in range(1, epochs + 1):
-        tr_loss, tr_acc = train_epoch(model, train_loader, optimizer)
-        vl_loss, vl_acc = evaluate(model, val_loader)
+        tr_loss, tr_1, tr_3 = train_epoch(model, train_loader, optimizer)
+        vl_loss, vl_1, vl_3 = evaluate(model, val_loader)
         scheduler.step()
 
         history["train_loss"].append(tr_loss)
         history["val_loss"  ].append(vl_loss)
-        history["train_acc" ].append(tr_acc)
-        history["val_acc"   ].append(vl_acc)
+        history["train_acc1"].append(tr_1)
+        history["val_acc1"  ].append(vl_1)
+        history["train_acc3"].append(tr_3)
+        history["val_acc3"  ].append(vl_3)
+
+        # Checkpoint best model
+        if vl_1 > best_val_acc:
+            best_val_acc = vl_1
+            best_weights = copy.deepcopy(model.state_dict())
+            no_improve   = 0
+        else:
+            no_improve += 1
 
         if verbose and (epoch % 10 == 0 or epoch == 1):
-            print(
-                f"  Epoch {epoch:3d}/{epochs} | "
-                f"Loss {tr_loss:.3f}/{vl_loss:.3f} | "
-                f"Acc  {tr_acc*100:.1f}%/{vl_acc*100:.1f}%  "
-                f"(train/val)"
-            )
+            print(f"  Epoch {epoch:3d}/{epochs} | "
+                  f"Loss {tr_loss:.3f}/{vl_loss:.3f} | "
+                  f"Top1 {tr_1*100:.1f}%/{vl_1*100:.1f}% | "
+                  f"Top3 {tr_3*100:.1f}%/{vl_3*100:.1f}%")
 
-    best_val = max(history["val_acc"])
+        # Early stopping
+        if no_improve >= patience:
+            if verbose:
+                print(f"\n  Early stopping at epoch {epoch} "
+                      f"(no improvement for {patience} epochs).")
+            break
+
+    # Restore best weights
+    model.load_state_dict(best_weights)
+
     if verbose:
-        print(f"\n  Best val accuracy : {best_val*100:.1f}%")
-        print(f"  Baseline          : {baseline_acc*100:.1f}%")
-        improvement = best_val / baseline_acc if baseline_acc > 0 else 0
-        print(f"  Improvement       : {improvement:.1f}× over random")
-        print(f"{'='*60}\n")
+        _, final_1, final_3 = evaluate(model, val_loader)
+        print(f"\n  Best val Top-1 : {best_val_acc*100:.1f}%  "
+              f"(baseline {baseline_1*100:.1f}% → {best_val_acc/baseline_1:.1f}×)")
+        print(f"  Best val Top-3 : {final_3*100:.1f}%  "
+              f"(baseline {baseline_3*100:.1f}% → {final_3/baseline_3:.1f}×)")
+        print(f"{'='*62}\n")
 
     return model, history
 
 
-# ─── Model comparison ─────────────────────────────────────────────────────────
+# ── Model comparison table ──────────────────────────────────────────────────────
 
-def compare_models(
-    gcn_model,
-    gat_model,
-    val_graphs: list,
-    batch_size: int = 32,
-) -> pd.DataFrame:
+def compare_models(gcn_model, gat_model, val_graphs, batch_size=32):
     """
-    Build a comparison table for GCN vs GAT.
-
-    Measures:
-      - Validation accuracy
-      - Parameter count
-      - Average inference time per graph (ms)
-
-    Returns
-    -------
-    pandas.DataFrame  with columns: Model, Val Accuracy, Parameters,
-                                    Avg Inference (ms)
+    Build a comparison DataFrame including Top-1, Top-3, parameters, speed.
     """
     val_loader = DataLoader(val_graphs, batch_size=batch_size, shuffle=False)
     rows = []
 
     for name, model in [("GCN", gcn_model), ("GAT", gat_model)]:
-        # Accuracy
-        _, acc = evaluate(model, val_loader)
+        _, acc1, acc3 = evaluate(model, val_loader)
 
-        # Inference time (average per graph)
         model.eval()
         times = []
         with torch.no_grad():
@@ -283,32 +219,29 @@ def compare_models(
                 t0 = time.perf_counter()
                 model(batch)
                 t1 = time.perf_counter()
-                n_graphs_in_batch = (len(batch.ptr) - 1)
-                times.append((t1 - t0) * 1000 / n_graphs_in_batch)  # ms per graph
-
-        avg_ms = np.mean(times)
+                n_graphs = len(batch.ptr) - 1
+                times.append((t1 - t0) * 1000 / n_graphs)
 
         rows.append({
             "Model"             : name,
-            "Val Accuracy"      : f"{acc*100:.1f}%",
+            "Top-1 Accuracy"    : f"{acc1*100:.1f}%",
+            "Top-3 Accuracy"    : f"{acc3*100:.1f}%",
             "Parameters"        : f"{model.count_parameters():,}",
-            "Avg Inference (ms)": f"{avg_ms:.2f}",
+            "Avg Inference (ms)": f"{np.mean(times):.2f}",
         })
 
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
-# ─── Standalone test ──────────────────────────────────────────────────────────
+# ── Standalone smoke test ──────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
-
-    from data.loader  import load_corners
+    from data.loader   import load_corners
     from graph.builder import build_dataset
 
-    print("Loading data ...")
+    print("Loading v2 data ...")
     corners = load_corners(use_cache=True)
     graphs  = build_dataset(corners)
 
@@ -316,13 +249,11 @@ if __name__ == "__main__":
         print("Not enough graphs. Run `python -m data.loader` first.")
         sys.exit(1)
 
-    # Quick 5-epoch smoke test
-    gcn_model, gcn_history = run_full_training(graphs, model_name="gcn", epochs=5, verbose=True)
-    gat_model, gat_history = run_full_training(graphs, model_name="gat", epochs=5, verbose=True)
+    gcn, gcn_h = run_full_training(graphs, "gcn", epochs=10, verbose=True)
+    gat, gat_h = run_full_training(graphs, "gat", epochs=10, verbose=True)
 
     from sklearn.model_selection import train_test_split
-    _, val_graphs = train_test_split(graphs, test_size=0.2, random_state=42)
-
-    df = compare_models(gcn_model, gat_model, val_graphs)
-    print("\nModel Comparison:")
+    _, val_g = train_test_split(graphs, test_size=0.2, random_state=42)
+    df = compare_models(gcn, gat, val_g)
+    print("\nv2 Model Comparison:")
     print(df.to_string(index=False))
